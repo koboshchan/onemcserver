@@ -1,7 +1,11 @@
 import asyncio, json
 from mc_packets import Encode, Decode
 
-config = json.load(open("config.json", "r"))
+try:
+    config = json.load(open("config.json", "r"))
+except FileNotFoundError:
+    print("[!] ERROR: config.json not found. Did you mount the volume?")
+    exit(1)
 
 
 async def handle_client(reader, writer):
