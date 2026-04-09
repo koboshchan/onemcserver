@@ -76,23 +76,39 @@ async def handle_client(reader, writer):
         if handshake_data["next_state"] == 1:
             print(f"received server list ping from {addr}.")
             try:
-                reader_rem, writer_rem = await asyncio.open_connection(
-                    config[handshake_data["address"]][0],
-                    config[handshake_data["address"]][1],
+                reader_rem, writer_rem = await asyncio.wait_for(
+                    asyncio.open_connection(
+                        config[handshake_data["address"]][0],
+                        config[handshake_data["address"]][1],
+                    ),
+                    timeout=2.0,
                 )
-            except Exception as e:
-                print(f"[!] Failed to connect to remote: {e}")
-                writer.close()
-                return
+                writer_rem.write(raw_handshake)
+                await writer_rem.drain()
 
-            writer_rem.write(raw_handshake)
-            await writer_rem.drain()
-            response1 = await reader_rem.read(8192)
-            writer.write(response1)
-            await writer.drain()
-            print(f"[S -> C] Server List Ping response sent to {addr}.")
-            writer_rem.close()
-            await writer_rem.wait_closed()
+                response1 = await asyncio.wait_for(reader_rem.read(8192), timeout=2.0)
+
+                writer.write(response1)
+                await writer.drain()
+                print(f"[S -> C] Server List Ping response sent to {addr}.")
+                writer_rem.close()
+                await writer_rem.wait_closed()
+            except (asyncio.TimeoutError, Exception) as e:
+                print(f"[!] Ping failed for {handshake_data['address']}: {e}")
+                # Send "Server Offline" status response
+                json_response = {
+                    "version": {"name": "Offline", "protocol": 0},
+                    "players": {"max": 0, "online": 0},
+                    "description": {"text": "§cServer is offline"},
+                }
+                response_packet = Encode.status_response(
+                    json_response, compression=False
+                )
+                writer.write(response_packet)
+                await writer.drain()
+
+            writer.close()
+            await writer.wait_closed()
             return
         else:
             print(f"received login handshake from {addr}.")
