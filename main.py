@@ -1,6 +1,5 @@
 import asyncio, json
 from mc_packets import Encode, Decode
-import socket
 
 config = json.load(open("config.json", "r"))
 

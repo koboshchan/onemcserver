@@ -1,0 +1,8 @@
+services:
+  onemcserver:
+    build:
+      context: .
+    ports:
+      - 25565:25565
+    volumes:
+      - config:/app/config.json:ro
