@@ -30,22 +30,23 @@ class Encode:
 
     @staticmethod
     def set_compression(threshold=256, compression=False):
-        return (
-            Encode.encode_varint(1)
-            + Encode.encode_varint(0x03)
-            + Encode.encode_varint(threshold)
-        )
+        # The Set Compression packet (ID 0x03) needs to be framed correctly.
+        # [Packet Length] [ID 0x03] [Threshold (VarInt)]
+        data = Encode.encode_varint(0x03) + Encode.encode_varint(threshold)
+        return Encode.encode_varint(len(data)) + data
 
     @staticmethod
     def login_success(
         uuid="ba096d9aed4a3689b7502eed340ad2cd", username="kobosh", compression=True
     ):
+        # Body: UUID (16 bytes), Username (VarInt+String), Property count (VarInt)
         body = (
             bytes.fromhex(uuid)
             + Encode.encode_varint(len(username))
             + username.encode()
-            + b"\x00"
+            + Encode.encode_varint(0)
         )
+        # Login Success packet ID: 0x02
         return Encode._create_raw(0x02, body, compression=compression)
 
     @staticmethod
@@ -54,7 +55,7 @@ class Encode:
         return Encode._create_raw(0x01, data, compression=compression)
 
     @staticmethod
-    def select_known_packs(version,namespace="minecraft",id="core",compression=True):
+    def select_known_packs(version, namespace="minecraft", id="core", compression=True):
         body = (
             b"\x01"
             + Encode.encode_varint(len(namespace))
@@ -65,6 +66,21 @@ class Encode:
             + version.encode()
         )
         return Encode._create_raw(0x0E, body, compression=compression)
+
+    @staticmethod
+    def disconnect(reason='"Disconnected"', compression=True):
+        # 1. Minecraft expects Chat components to be JSON strings
+        # Ensure the reason is wrapped in quotes if it's a plain message
+        if not reason.startswith("{") and not reason.startswith('"'):
+            reason = f'"{reason}"'
+
+        # 2. Encode to UTF-8 bytes first
+        reason_bytes = reason.encode("utf-8")
+
+        # 3. Use the length of the BYTES for the VarInt
+        data = Encode.encode_varint(len(reason_bytes)) + reason_bytes
+
+        return Encode._create_raw(0x00, data, compression=compression)
 
 
 class Decode:
@@ -103,11 +119,16 @@ class Decode:
 
     @staticmethod
     def login_start(data):
+        if not data or len(data) < 3:
+            return {"name": "login_start", "username": "unknown", "uuid": "00"}
         offset = 0
         length, offset = Decode._read_varint(data, offset)
         packet_id, offset = Decode._read_varint(data, offset)
         username, offset = Decode._read_string(data, offset)
-        uuid = data[offset : offset + 16].hex()
+        # Check if UUID exists in packet
+        uuid = ""
+        if offset + 16 <= len(data):
+            uuid = data[offset : offset + 16].hex()
         return {"name": "login_start", "username": username, "uuid": uuid}
 
     @staticmethod
