@@ -83,32 +83,61 @@ async def handle_client(reader, writer):
                     ),
                     timeout=2.0,
                 )
+
+                # Forward Handshake
                 writer_rem.write(raw_handshake)
                 await writer_rem.drain()
 
-                response1 = await asyncio.wait_for(reader_rem.read(8192), timeout=2.0)
+                # Simple pipe function to bridge two streams
+                async def pipe(r, w):
+                    try:
+                        while True:
+                            data = await r.read(8192)
+                            if not data:
+                                break
+                            w.write(data)
+                            await w.drain()
+                    except Exception:
+                        pass
+                    finally:
+                        try:
+                            w.close()
+                            await w.wait_closed()
+                        except:
+                            pass
 
-                writer.write(response1)
-                await writer.drain()
-                print(f"[S -> C] Server List Ping response sent to {addr}.")
-                writer_rem.close()
-                await writer_rem.wait_closed()
+                # Forward packets in both directions
+                t1 = asyncio.create_task(pipe(reader, writer_rem))
+                t2 = asyncio.create_task(pipe(reader_rem, writer))
+
+                # Wait for both pipes to finish (with a generous timeout)
+                await asyncio.wait_for(asyncio.gather(t1, t2), timeout=5.0)
+
+                print(f"[S -> C] Server List Ping communication completed for {addr}.")
             except (asyncio.TimeoutError, Exception) as e:
                 print(f"[!] Ping failed for {handshake_data['address']}: {e}")
-                # Send "Server Offline" status response
+                # Send "Server Offline" status response if not already sent
                 json_response = {
-                    "version": {"name": "Offline", "protocol": 0},
+                    "version": {"name": "onemcserver", "protocol": 0},
                     "players": {"max": 0, "online": 0},
                     "description": {"text": "§cServer is offline"},
                 }
                 response_packet = Encode.status_response(
                     json_response, compression=False
                 )
-                writer.write(response_packet)
-                await writer.drain()
+                # Ensure we don't try to write if client connection closed
+                try:
+                    writer.write(response_packet)
+                    await writer.drain()
+                except:
+                    pass
 
+            # Cleanup
             writer.close()
-            await writer.wait_closed()
+            try:
+                await writer.wait_closed()
+            except:
+                pass
             return
         else:
             print(f"received login handshake from {addr}.")
