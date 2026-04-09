@@ -1,6 +1,6 @@
 services:
   onemcserver:
-    image: ghcr.io/koboshchan/onemcserver:latest
+    image: ghcr.io/koboshchan/onemcserver:main
     build:
       context: .
     ports:
