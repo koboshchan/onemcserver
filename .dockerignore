@@ -30,6 +30,7 @@
 **/obj
 **/secrets.dev.yaml
 **/values.dev.yaml
-**/.ruff_cache
 LICENSE
 README.md
+**/.ruff_cache
+mongodb_data

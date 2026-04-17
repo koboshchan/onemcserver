@@ -8,3 +8,4 @@ package.json
 .conda
 .ruff_cache
 config.json
+mongodb_data

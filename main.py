@@ -1,7 +1,21 @@
 import asyncio, json, requests, hashlib, uuid, zlib, struct
+from datetime import datetime, timezone
+from motor.motor_asyncio import AsyncIOMotorClient
 from mc_packets import Encode, Decode
 from mc_crypto import minecraft_sha1, MinecraftCipher, EncryptionContext
 from mc_protocol import get_packet_id
+
+# MongoDB Setup
+mongo_client = AsyncIOMotorClient("mongodb://mongo:27017")
+db = mongo_client.onemcserver
+cache_col = db.user_cache
+
+
+async def init_db():
+    # Create TTL index that expires documents 1 hour (3600 seconds) after the 'created' time
+    await cache_col.create_index("created", expireAfterSeconds=3600)
+    print("[*] MongoDB Cache Initialized (1h TTL)")
+
 
 try:
     config_list = json.load(open("config.json", "r"))
@@ -77,13 +91,45 @@ class MinecraftStream:
 
 
 async def get_premium_profile(username):
+    # Check MongoDB cache first
+    cached = await cache_col.find_one({"name": username})
+    if cached:
+        if cached["microsoft"]:
+            return {"id": cached["uuid"], "name": cached["name"]}
+        return None
+
     url = f"https://api.mojang.com/users/profiles/minecraft/{username}"
     try:
         res = requests.get(url, timeout=3)
         if res.status_code == 200:
-            return res.json()
-    except:
-        pass
+            profile = res.json()
+            await cache_col.update_one(
+                {"name": username},
+                {
+                    "$set": {
+                        "microsoft": True,
+                        "uuid": profile["id"],
+                        "created": datetime.now(timezone.utc),
+                    }
+                },
+                upsert=True,
+            )
+            return profile
+        elif res.status_code == 204:  # No content = cracked
+            await cache_col.update_one(
+                {"name": username},
+                {
+                    "$set": {
+                        "microsoft": False,
+                        "uuid": None,
+                        "created": datetime.now(timezone.utc),
+                    }
+                },
+                upsert=True,
+            )
+            return None
+    except Exception as e:
+        print(f"[!] Error checking Mojang API: {e}")
     return None
 
 
@@ -212,9 +258,7 @@ async def handle_client(reader, writer):
                     user_uuid = str(uuid.UUID(verified_profile["id"]))
                     properties = verified_profile.get("properties", [])
                 else:
-                    print(
-                        f"[!] {username} failed verification. Kicking (Premium name theft)."
-                    )
+                    print(f"[!] {username} failed verification. Kicking.")
                     stream.write_packet(
                         "disconnect",
                         "login",
@@ -245,7 +289,7 @@ async def handle_client(reader, writer):
                 await stream.drain()
                 stream.close()
                 return
-            print(f"[-] {username} is CRACKED (Offline - non-premium name)")
+            print(f"[-] {username} is CRACKED")
             user_uuid = str(uuid.uuid3(uuid.NAMESPACE_DNS, f"OfflinePlayer:{username}"))
 
         stream.write_packet(
@@ -284,6 +328,7 @@ async def handle_client(reader, writer):
 
 
 async def main():
+    await init_db()
     server = await asyncio.start_server(handle_client, "0.0.0.0", 25565)
     print("Listening on 25565 (Hybrid Multi-Version Proxy)...")
     async with server:
