@@ -33,4 +33,5 @@
 LICENSE
 README.md
 **/.ruff_cache
+**/.conda
 mongodb_data

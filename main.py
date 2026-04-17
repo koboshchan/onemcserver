@@ -1,4 +1,4 @@
-import asyncio, json, requests, hashlib, uuid, zlib, struct
+import asyncio, json, requests, hashlib, uuid, zlib, struct, os
 from datetime import datetime, timezone
 from motor.motor_asyncio import AsyncIOMotorClient
 from mc_packets import Encode, Decode
@@ -233,6 +233,7 @@ async def handle_client(reader, writer):
         premium_profile = await get_premium_profile(username)
         user_uuid = None
         properties = []
+        is_premium = False
 
         if premium_profile:
             print(f"[*] {username} might be PREMIUM. Sending Encryption Request.")
@@ -257,6 +258,7 @@ async def handle_client(reader, writer):
                     print(f"[+] {username} is ONLINE (Premium)")
                     user_uuid = str(uuid.UUID(verified_profile["id"]))
                     properties = verified_profile.get("properties", [])
+                    is_premium = True
                 else:
                     print(f"[!] {username} failed verification. Kicking.")
                     stream.write_packet(
@@ -302,21 +304,73 @@ async def handle_client(reader, writer):
             "success", "login", Encode.login_success(user_uuid, username, properties)
         )
         await stream.drain()
+        print(f"[*] Sent Login Success to {username}")
 
-        await stream.read_packet()  # Login Acknowledged
+        try:
+            await asyncio.wait_for(
+                stream.read_packet(), timeout=5.0
+            )  # Login Acknowledged
+            print(f"[*] Received Login Acknowledged from {username}")
+        except asyncio.TimeoutError:
+            print(f"[!] Timeout waiting for Login Acknowledged from {username}")
+            stream.close()
+            return
 
+        if is_premium:
+            print(
+                f"[*] Instant Transfer for PREMIUM user {username} to {target_host}:{target_port}"
+            )
+            stream.write_packet(
+                "transfer", "configuration", Encode.transfer(target_host, target_port)
+            )
+            await stream.drain()
+            stream.close()
+            return
+
+        # --- CONFIGURATION FOR CRACKED (LIMBO) ---
         stream.write_packet(
             "custom_payload", "configuration", Encode.brand("onemcserver")
         )
         stream.write_packet(
             "select_known_packs", "configuration", Encode.select_known_packs("1.21.1")
         )
-
-        print(f"[*] Transferring {username} to {target_host}:{target_port}")
-        stream.write_packet(
-            "transfer", "configuration", Encode.transfer(target_host, target_port)
-        )
         await stream.drain()
+
+        # Wait for client's known_packs response
+        await stream.read_packet()
+
+        # Send Registries (Mandatory for 1.20.5+)
+        from mc_protocol import loader
+
+        version_str = loader.proto_to_version.get(stream.protocol_version, "1.21.1")
+        lp_path = os.path.join(
+            "minecraft-data-repo", "data", "pc", version_str, "loginPacket.json"
+        )
+        if not os.path.exists(lp_path):
+            lp_path = os.path.join(
+                "minecraft-data-repo", "data", "pc", "1.21.1", "loginPacket.json"
+            )
+
+        lp_data = json.load(open(lp_path))
+        codec = lp_data.get("dimensionCodec", {})
+
+        for reg_id, reg_data in codec.items():
+            entries = reg_data.get("entries", [])
+            print(f"[*] Syncing registry: {reg_id} with {len(entries)} entries")
+            body = Encode.encode_string(reg_id)
+            body += Encode.encode_varint(len(entries))
+            for reg_entry in entries:
+                body += Encode.encode_string(reg_entry["key"])
+                if reg_entry.get("value"):
+                    body += b"\x01" + Encode.encode_anonymous_nbt(reg_entry["value"])
+                else:
+                    body += b"\x00"
+            stream.write_packet("registry_data", "configuration", body)
+
+        from mc_engine import AuthEngine
+
+        engine = AuthEngine(stream, username, target_host, target_port, cache_col)
+        await engine.enter_limbo()
 
     except Exception as e:
         if not isinstance(e, (asyncio.IncompleteReadError, ConnectionResetError)):

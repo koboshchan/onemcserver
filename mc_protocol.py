@@ -24,15 +24,19 @@ class ProtocolLoader:
             version_str = "1.21.1"
         if version_str in self._cache:
             return self._cache[version_str]
+
         pc_data = self.data_paths.get("pc", {})
         version_entry = pc_data.get(version_str)
         if not version_entry:
+            # Fallback to a close match if version_str is not in data_paths
             version_str = "1.21.1"
             version_entry = pc_data.get(version_str)
+
         protocol_rel_path = version_entry.get("protocol")
         protocol_path = os.path.join(
             self.repo_path, "data", protocol_rel_path, "protocol.json"
         )
+
         proto = json.load(open(protocol_path))
         self._cache[version_str] = proto
         return proto
@@ -41,31 +45,41 @@ class ProtocolLoader:
 loader = ProtocolLoader("minecraft-data-repo")
 
 
-def find_mappings(obj):
-    if isinstance(obj, dict):
-        if "mappings" in obj:
-            return obj["mappings"]
-        for v in obj.values():
-            res = find_mappings(v)
-            if res:
-                return res
-    elif isinstance(obj, list):
-        for v in obj:
-            res = find_mappings(v)
-            if res:
-                return res
-    return None
-
-
 def get_packet_id(protocol_number, state, direction, packet_name):
+    """
+    Looks up packet ID for a given state (handshaking, status, login, configuration, play)
+    and direction (toClient, toServer).
+    """
     try:
         proto = loader.get_protocol(protocol_number)
         state_data = proto.get(state, {}).get(direction, {})
-        mappings = find_mappings(state_data)
-        if mappings:
-            for pid_hex, name in mappings.items():
-                if name == packet_name:
-                    return int(pid_hex, 16)
-    except Exception:
-        pass
+        types = state_data.get("types", {})
+
+        # Deep search for packet name mappings
+        def find_mappings_recursive(obj):
+            if isinstance(obj, dict):
+                if "mappings" in obj and isinstance(obj["mappings"], dict):
+                    for pid, name in obj["mappings"].items():
+                        if name == packet_name:
+                            return int(pid, 16) if pid.startswith("0x") else int(pid)
+                for v in obj.values():
+                    res = find_mappings_recursive(v)
+                    if res is not None:
+                        return res
+            elif isinstance(obj, list):
+                for v in obj:
+                    res = find_mappings_recursive(v)
+                    if res is not None:
+                        return res
+            return None
+
+        # Prioritize looking in the 'packet' type definition
+        if "packet" in types:
+            res = find_mappings_recursive(types["packet"])
+            if res is not None:
+                return res
+
+        return find_mappings_recursive(types)
+    except Exception as e:
+        print(f"[!] get_packet_id error: {e}")
     return None
