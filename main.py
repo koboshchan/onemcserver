@@ -1,218 +1,273 @@
-import asyncio, json
-from mc_packets import Encode, Decode, get_version_handler
+import asyncio, json, requests, hashlib, uuid, zlib, struct
+from mc_packets import Encode, Decode
+from mc_crypto import minecraft_sha1, MinecraftCipher, EncryptionContext
+from mc_protocol import get_packet_id
 
 try:
     config = json.load(open("config.json", "r"))
 except FileNotFoundError:
-    print("[!] ERROR: config.json not found. Did you mount the volume?")
+    print("[!] ERROR: config.json not found.")
     exit(1)
 
 
-async def read_varint_from_stream(reader, max_bytes=5):
-    value = 0
-    for i in range(max_bytes):
-        byte = (await reader.readexactly(1))[0]
-        value |= (byte & 0x7F) << (7 * i)
-        if not (byte & 0x80):
-            return value
-    raise ValueError("VarInt too long")
+class MinecraftStream:
+    def __init__(self, reader, writer):
+        self.reader = reader
+        self.writer = writer
+        self.cipher = None
+        self.compression_threshold = -1
+        self.protocol_version = 767
+
+    def enable_encryption(self, shared_secret):
+        self.cipher = MinecraftCipher(shared_secret)
+
+    async def _read(self, n):
+        data = await self.reader.readexactly(n)
+        if self.cipher:
+            data = self.cipher.decrypt(data)
+        return data
+
+    async def read_varint(self):
+        value = 0
+        for i in range(5):
+            byte_data = await self._read(1)
+            b = byte_data[0]
+            value |= (b & 0x7F) << (7 * i)
+            if not (b & 0x80):
+                return value
+        raise ValueError("VarInt too long")
+
+    async def read_packet(self):
+        length = await self.read_varint()
+        data = await self._read(length)
+        if self.compression_threshold >= 0:
+            data_len, offset = Decode._read_varint(data, 0)
+            if data_len > 0:
+                data = zlib.decompress(data[offset:])
+            else:
+                data = data[offset:]
+        return data
+
+    def write_packet(self, packet_name, state, data, force_uncompressed=False):
+        packet_id = get_packet_id(self.protocol_version, state, "toClient", packet_name)
+        if packet_id is None:
+            print(f"[!] ID not found for {packet_name}")
+            return
+        payload = Encode.encode_varint(packet_id) + data
+        if self.compression_threshold >= 0 and not force_uncompressed:
+            if len(payload) >= self.compression_threshold:
+                compressed = zlib.compress(payload)
+                data_framed = Encode.encode_varint(len(payload)) + compressed
+            else:
+                data_framed = Encode.encode_varint(0) + payload
+        else:
+            data_framed = payload
+        full_packet = Encode.encode_varint(len(data_framed)) + data_framed
+        if self.cipher:
+            full_packet = self.cipher.encrypt(full_packet)
+        self.writer.write(full_packet)
+
+    async def drain(self):
+        await self.writer.drain()
+
+    def close(self):
+        self.writer.close()
 
 
-async def read_packet(reader):
-    packet_length = await read_varint_from_stream(reader)
-    payload = await reader.readexactly(packet_length)
-    return Encode.encode_varint(packet_length) + payload
+async def get_premium_profile(username):
+    url = f"https://api.mojang.com/users/profiles/minecraft/{username}"
+    try:
+        res = requests.get(url, timeout=3)
+        if res.status_code == 200:
+            return res.json()
+    except:
+        pass
+    return None
+
+
+async def verify_has_joined(username, server_hash):
+    url = f"https://sessionserver.mojang.com/session/minecraft/hasJoined?username={username}&serverId={server_hash}"
+    try:
+        res = requests.get(url, timeout=5)
+        if res.status_code == 200:
+            return res.json()
+    except:
+        pass
+    return None
 
 
 async def handle_client(reader, writer):
+    stream = MinecraftStream(reader, writer)
     addr = writer.get_extra_info("peername")
     print(f"[*] Connection from {addr}")
+
     try:
-        # 1. Receive Handshake
-        raw_handshake = await read_packet(reader)
-        if not raw_handshake:
-            raise ConnectionResetError(
-                "Client closed connection before sending handshake"
-            )
-        handshake_data = Decode.handshake(raw_handshake)
-        packet_handler = get_version_handler(handshake_data["protocol_version"])
-        print(f"[C -> S] Handshake: {Decode.handshake(raw_handshake)}")
-        if handshake_data["address"] not in config.keys():
-            if handshake_data["next_state"] == 1:
-                print(
-                    f"Received ping for unknown domain {handshake_data['address']} from {addr}. Sending fake response."
-                )
-                try:
-                    # Read the Status Request packet (ID 0x00)
-                    await read_packet(reader)
-                    # Construct and send Status Response
-                    json_response = {
-                        "version": {"name": "onemcserver", "protocol": 0},
-                        "players": {"max": 0, "online": 0},
-                        "description": {"text": "Unknown Domain"},
-                    }
-                    response_packet = Encode.status_response(
-                        json_response, compression=False
+        # 1. Handshake
+        raw_handshake = await stream.read_packet()
+        handshake = Decode.handshake(raw_handshake)
+        stream.protocol_version = handshake["protocol_version"]
+        host = handshake["address"].split("\0")[0].lower()
+
+        if host not in config:
+            if handshake["next_state"] == 1:
+                await stream.read_packet()
+                stream.writer.write(
+                    Encode.status_response(
+                        {
+                            "version": {"name": "onemcserver", "protocol": 0},
+                            "players": {"max": 0, "online": 0},
+                            "description": {"text": "Unknown Domain"},
+                        }
                     )
-                    writer.write(response_packet)
-                    await writer.drain()
-                    writer.close()
-                    await writer.wait_closed()
-                    return
-                except Exception as e:
-                    print(f"[!] Ping error for unknown domain: {e}")
-                    writer.close()
-                    return
-            print(
-                f"Received handshake for unknown domain {handshake_data['address']} from {addr}. Closing connection."
-            )
-            kick = packet_handler.disconnect(
-                "Unknown domain. Please connect to a valid subdomain.",
-                compression=False,
-            )
-            writer.write(kick)
-            await writer.drain()
-            raise ConnectionResetError("Unknown domain")
-        if handshake_data["next_state"] == 1:
-            print(f"received server list ping from {addr}.")
-            try:
-                reader_rem, writer_rem = await asyncio.wait_for(
-                    asyncio.open_connection(
-                        config[handshake_data["address"]][0],
-                        config[handshake_data["address"]][1],
-                    ),
-                    timeout=2.0,
                 )
+                await stream.drain()
+            else:
+                stream.write_packet(
+                    "disconnect", "login", Encode.disconnect(f"Unknown domain: {host}")
+                )
+                await stream.drain()
+            stream.close()
+            return
 
-                # Forward Handshake
-                writer_rem.write(raw_handshake)
-                await writer_rem.drain()
+        if handshake["next_state"] == 1:
+            # Ping logic (omitted for brevity, keeping original forwarding)
+            target_host, target_port = config[host]
+            try:
+                r_rem, w_rem = await asyncio.wait_for(
+                    asyncio.open_connection(target_host, target_port), timeout=2.0
+                )
+                hs_payload = (
+                    Encode.encode_varint(0x00)
+                    + Encode.encode_varint(handshake["protocol_version"])
+                    + Encode.encode_string(handshake["address"])
+                    + struct.pack(">H", handshake["port"])
+                    + Encode.encode_varint(1)
+                )
+                w_rem.write(Encode.encode_varint(len(hs_payload)) + hs_payload)
 
-                # Simple pipe function to bridge two streams
                 async def pipe(r, w):
                     try:
                         while True:
-                            data = await r.read(8192)
-                            if not data:
+                            d = await r.read(8192)
+                            if not d:
                                 break
-                            w.write(data)
+                            w.write(d)
                             await w.drain()
-                    except Exception:
+                    except:
                         pass
                     finally:
-                        try:
-                            w.close()
-                            await w.wait_closed()
-                        except:
-                            pass
+                        w.close()
 
-                # Forward packets in both directions
-                t1 = asyncio.create_task(pipe(reader, writer_rem))
-                t2 = asyncio.create_task(pipe(reader_rem, writer))
-
-                # Wait for both pipes to finish (with a generous timeout)
-                await asyncio.wait_for(asyncio.gather(t1, t2), timeout=5.0)
-
-                print(f"[S -> C] Server List Ping communication completed for {addr}.")
-            except (asyncio.TimeoutError, Exception) as e:
-                print(f"[!] Ping failed for {handshake_data['address']}: {e}")
-                # Send "Server Offline" status response if not already sent
-                json_response = {
-                    "version": {"name": "onemcserver", "protocol": 0},
-                    "players": {"max": 0, "online": 0},
-                    "description": {"text": "§cServer is offline"},
-                }
-                response_packet = Encode.status_response(
-                    json_response, compression=False
-                )
-                # Ensure we don't try to write if client connection closed
-                try:
-                    writer.write(response_packet)
-                    await writer.drain()
-                except:
-                    pass
-
-            # Cleanup
-            writer.close()
-            try:
-                await writer.wait_closed()
+                asyncio.create_task(pipe(reader, w_rem))
+                await pipe(r_rem, writer)
             except:
-                pass
+                stream.writer.write(
+                    Encode.status_response(
+                        {
+                            "version": {"name": "offline", "protocol": 0},
+                            "players": {"max": 0, "online": 0},
+                            "description": {"text": "§cServer Offline"},
+                        }
+                    )
+                )
+                await stream.drain()
+                stream.close()
             return
+
+        # 2. Login Start
+        raw_login_start = await stream.read_packet()
+        login_start = Decode.login_start(raw_login_start)
+        username = login_start["username"]
+
+        # SMART HYBRID DETECTION
+        premium_profile = await get_premium_profile(username)
+        user_uuid = None
+        properties = []
+        shared_secret = None
+
+        if premium_profile:
+            print(f"[*] {username} might be PREMIUM. Sending Encryption Request.")
+            ctx = EncryptionContext()
+            stream.write_packet(
+                "encryption_begin",
+                "login",
+                Encode.encryption_request(ctx.public_key_der, ctx.verify_token),
+            )
+            await stream.drain()
+
+            raw_encryption_res = await stream.read_packet()
+            enc_res = Decode.encryption_response(raw_encryption_res)
+            shared_secret = ctx.decrypt_shared_secret(enc_res["shared_secret"])
+            verify_token = ctx.decrypt_verify_token(enc_res["verify_token"])
+
+            if verify_token == ctx.verify_token:
+                stream.enable_encryption(shared_secret)
+                server_hash = minecraft_sha1(b"", shared_secret, ctx.public_key_der)
+                verified_profile = await verify_has_joined(username, server_hash)
+                if verified_profile:
+                    print(f"[+] {username} is ONLINE (Premium)")
+                    user_uuid = str(uuid.UUID(verified_profile["id"]))
+                    properties = verified_profile.get("properties", [])
+                else:
+                    print(f"[-] {username} is CRACKED (Offline - using premium name)")
+                    user_uuid = str(
+                        uuid.uuid3(uuid.NAMESPACE_DNS, f"OfflinePlayer:{username}")
+                    )
+            else:
+                print(f"[!] Verify token mismatch for {username}")
+                stream.write_packet(
+                    "disconnect", "login", Encode.disconnect("Invalid verify token")
+                )
+                await stream.drain()
+                stream.close()
+                return
         else:
-            print(f"received login handshake from {addr}.")
-            # 2. Receive Login Start
-            raw_login = await read_packet(reader)
-            if not raw_login:
-                raise ConnectionResetError(
-                    "Client closed connection before Login Start"
-                )
-            print(f"[C -> S] Login Start: {Decode.login_start(raw_login)}")
+            print(f"[-] {username} is CRACKED (Offline - non-premium name)")
+            user_uuid = str(uuid.uuid3(uuid.NAMESPACE_DNS, f"OfflinePlayer:{username}"))
 
-            # 3. SEND SET COMPRESSION
-            writer.write(
-                packet_handler.set_compression(threshold=256, compression=False)
-            )
-            await writer.drain()
-            print("[S -> C] Set Compression sent.")
+        # 6. Set Compression
+        stream.write_packet(
+            "compress", "login", Encode.set_compression(256), force_uncompressed=True
+        )
+        await stream.drain()
+        stream.compression_threshold = 256
 
-            # 4. SEND LOGIN SUCCESS
-            # CRITICAL: This MUST be True because Set Compression is now active
-            writer.write(packet_handler.login_success(compression=True))
-            await writer.drain()
-            print("[S -> C] Login Success (Compressed Format) sent.")
+        # 7. Login Success
+        stream.write_packet(
+            "success", "login", Encode.login_success(user_uuid, username, properties)
+        )
+        await stream.drain()
 
-            # 5. WAIT FOR LOGIN ACKNOWLEDGED
-            raw_ack = await read_packet(reader)
-            print(f"[C -> S] Login Acknowledged: {Decode.login_acknowledged(raw_ack)}")
+        # 8. Login Acknowledged
+        await stream.read_packet()
 
-            # 6. WAIT FOR CLIENT CONFIG PACKETS
-            raw_config = await read_packet(reader)
-            print(f"[C -> S] Client Config: {Decode.client_config(raw_config)}")
-
-            # 7. SEND SERVER CONFIG PACKETS
-            writer.write(packet_handler.brand("onemcserver", compression=True))
-            # Known Packs packet (0x0E) - Required by 1.21.10+
-            writer.write(
-                packet_handler.select_known_packs(version="1.21.10", compression=True)
-            )
-            await writer.drain()
-
-            # 8. FINAL KICK: Transfer
-            writer.write(
-                packet_handler.transfer(
-                    config[handshake_data["address"]][0],
-                    config[handshake_data["address"]][1],
-                )
-            )
-            await writer.drain()
-
-            print(
-                f"[S -> C] Transferred to{config[handshake_data['address']][0]}:{config[handshake_data['address']][1]} sent to {addr}"
-            )
+        # 9. Configuration
+        stream.write_packet(
+            "custom_payload", "configuration", Encode.brand("onemcserver")
+        )
+        stream.write_packet(
+            "select_known_packs", "configuration", Encode.select_known_packs("1.21.1")
+        )
+        print(f"[*] Transferring {username} to {config[host][0]}:{config[host][1]}")
+        stream.write_packet(
+            "transfer",
+            "configuration",
+            Encode.transfer(config[host][0], config[host][1]),
+        )
+        await stream.drain()
 
     except Exception as e:
-        if isinstance(
-            e, (ConnectionResetError, BrokenPipeError, asyncio.IncompleteReadError)
-        ):
-            pass  # Expected disconnections, don't log
-        elif isinstance(e, ValueError):
-            print(f"[!] Malformed packet from {addr}: {e}")
-        else:
-            print(f"[!] Error handling {addr}: {e}")
+        if not isinstance(e, (asyncio.IncompleteReadError, ConnectionResetError)):
+            import traceback
+
+            traceback.print_exc()
     finally:
-        writer.close()
-        try:
-            await writer.wait_closed()
-        except:
-            pass
+        stream.close()
 
 
 async def main():
-    HOST = "0.0.0.0"
-    PORT = 25565
-    server = await asyncio.start_server(handle_client, HOST, PORT)
-    print(f"Listening on {PORT}...")
+    server = await asyncio.start_server(handle_client, "0.0.0.0", 25565)
+    print("Listening on 25565 (Robust Hybrid Proxy)...")
     async with server:
         await server.serve_forever()
 

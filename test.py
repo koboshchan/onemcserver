@@ -46,20 +46,20 @@ def start_proxy():
                 readable, _, _ = select.select(sockets, [], [])
 
                 for s in readable:
-                    data = s.recv(4096)
-                    if not data:
-                        running = False
-                        break
-
-                    # Forwarding
                     try:
+                        data = s.recv(4096)
+                        if not data:
+                            running = False
+                            break
+
+                        # Forwarding
                         if s is client_conn:
                             hex_dump(data, "C -> S")
                             remote_sock.sendall(data)
                         else:
                             hex_dump(data, "S -> C")
                             client_conn.sendall(data)
-                    except (ConnectionResetError, BrokenPipeError):
+                    except (ConnectionResetError, BrokenPipeError, OSError):
                         running = False
                         break
 
