@@ -212,18 +212,19 @@ async def handle_client(reader, writer):
                     user_uuid = str(uuid.UUID(verified_profile["id"]))
                     properties = verified_profile.get("properties", [])
                 else:
-                    if not allow_cracked:
-                        print(f"[!] {username} failed verification. Kicking.")
-                        stream.write_packet(
-                            "disconnect", "login", Encode.disconnect("Invalid session.")
-                        )
-                        await stream.drain()
-                        stream.close()
-                        return
-                    print(f"[-] {username} is CRACKED (Offline - using premium name)")
-                    user_uuid = str(
-                        uuid.uuid3(uuid.NAMESPACE_DNS, f"OfflinePlayer:{username}")
+                    print(
+                        f"[!] {username} failed verification. Kicking (Premium name theft)."
                     )
+                    stream.write_packet(
+                        "disconnect",
+                        "login",
+                        Encode.disconnect(
+                            "That name is registered to a premium account. Please log in with your official account."
+                        ),
+                    )
+                    await stream.drain()
+                    stream.close()
+                    return
             else:
                 stream.write_packet(
                     "disconnect", "login", Encode.disconnect("Invalid verify token")

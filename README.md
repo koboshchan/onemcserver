@@ -10,8 +10,30 @@ support subdomain wildcard: if you dont want to add A records for each domain, y
 
 make sure to also expose port of onemcserver (default: 25565) and your forwarding servers in your router and firewall.
 
+## Configuration
+
+Edit `config.json` to define your domain mappings:
+
+```json
+[
+    {
+        "host": "play.example.com",
+        "transfer_to": ["12.34.56.78", 25565],
+        "cracked_players": true
+    }
+]
+```
+
+- **host**: The domain name players use to connect.
+- **transfer_to**: The target IP/Domain and Port to redirect the player to.
+- **cracked_players**: Set to `true` to allow offline-mode players, or `false` to enforce Mojang authentication.
+
 ## Usage
 
-`python main.py`. all libraries are python built in, so no need to install anything. you can edit the config.json file to change the server's settings. {"server_domain":["forwarding_domain", forwarding_port]}.
+1. Install requirements:
+   `pip install -r requirements.txt`
 
-docker: `docker compose up -d --build` (make sure to edit the config.json file before running this command).
+2. Run the server:
+   `python main.py`
+
+Docker: `docker compose up -d --build` (make sure to edit the config.json file before running this command).
