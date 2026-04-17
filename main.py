@@ -4,7 +4,9 @@ from mc_crypto import minecraft_sha1, MinecraftCipher, EncryptionContext
 from mc_protocol import get_packet_id
 
 try:
-    config = json.load(open("config.json", "r"))
+    config_list = json.load(open("config.json", "r"))
+    config = {item["host"].lower(): item for item in config_list}
+    print(f"[*] Loaded config for hosts: {', '.join(config.keys())}")
 except FileNotFoundError:
     print("[!] ERROR: config.json not found.")
     exit(1)
@@ -108,7 +110,8 @@ async def handle_client(reader, writer):
         stream.protocol_version = handshake["protocol_version"]
         host = handshake["address"].split("\0")[0].lower()
 
-        if host not in config:
+        entry = config.get(host)
+        if not entry:
             if handshake["next_state"] == 1:
                 await stream.read_packet()
                 stream.writer.write(
@@ -129,9 +132,11 @@ async def handle_client(reader, writer):
             stream.close()
             return
 
+        target_host, target_port = entry["transfer_to"]
+        allow_cracked = entry.get("cracked_players", False)
+
         if handshake["next_state"] == 1:
-            # Ping logic (omitted for brevity, keeping original forwarding)
-            target_host, target_port = config[host]
+            print(f"[*] Status ping for {host} (Proto: {stream.protocol_version})")
             try:
                 r_rem, w_rem = await asyncio.wait_for(
                     asyncio.open_connection(target_host, target_port), timeout=2.0
@@ -179,11 +184,9 @@ async def handle_client(reader, writer):
         login_start = Decode.login_start(raw_login_start)
         username = login_start["username"]
 
-        # SMART HYBRID DETECTION
         premium_profile = await get_premium_profile(username)
         user_uuid = None
         properties = []
-        shared_secret = None
 
         if premium_profile:
             print(f"[*] {username} might be PREMIUM. Sending Encryption Request.")
@@ -209,12 +212,19 @@ async def handle_client(reader, writer):
                     user_uuid = str(uuid.UUID(verified_profile["id"]))
                     properties = verified_profile.get("properties", [])
                 else:
+                    if not allow_cracked:
+                        print(f"[!] {username} failed verification. Kicking.")
+                        stream.write_packet(
+                            "disconnect", "login", Encode.disconnect("Invalid session.")
+                        )
+                        await stream.drain()
+                        stream.close()
+                        return
                     print(f"[-] {username} is CRACKED (Offline - using premium name)")
                     user_uuid = str(
                         uuid.uuid3(uuid.NAMESPACE_DNS, f"OfflinePlayer:{username}")
                     )
             else:
-                print(f"[!] Verify token mismatch for {username}")
                 stream.write_packet(
                     "disconnect", "login", Encode.disconnect("Invalid verify token")
                 )
@@ -222,37 +232,44 @@ async def handle_client(reader, writer):
                 stream.close()
                 return
         else:
+            if not allow_cracked:
+                print(
+                    f"[!] {username} is cracked and cracked players are disabled for {host}. Kicking."
+                )
+                stream.write_packet(
+                    "disconnect",
+                    "login",
+                    Encode.disconnect("This server is in Online Mode."),
+                )
+                await stream.drain()
+                stream.close()
+                return
             print(f"[-] {username} is CRACKED (Offline - non-premium name)")
             user_uuid = str(uuid.uuid3(uuid.NAMESPACE_DNS, f"OfflinePlayer:{username}"))
 
-        # 6. Set Compression
         stream.write_packet(
             "compress", "login", Encode.set_compression(256), force_uncompressed=True
         )
         await stream.drain()
         stream.compression_threshold = 256
 
-        # 7. Login Success
         stream.write_packet(
             "success", "login", Encode.login_success(user_uuid, username, properties)
         )
         await stream.drain()
 
-        # 8. Login Acknowledged
-        await stream.read_packet()
+        await stream.read_packet()  # Login Acknowledged
 
-        # 9. Configuration
         stream.write_packet(
             "custom_payload", "configuration", Encode.brand("onemcserver")
         )
         stream.write_packet(
             "select_known_packs", "configuration", Encode.select_known_packs("1.21.1")
         )
-        print(f"[*] Transferring {username} to {config[host][0]}:{config[host][1]}")
+
+        print(f"[*] Transferring {username} to {target_host}:{target_port}")
         stream.write_packet(
-            "transfer",
-            "configuration",
-            Encode.transfer(config[host][0], config[host][1]),
+            "transfer", "configuration", Encode.transfer(target_host, target_port)
         )
         await stream.drain()
 
@@ -267,7 +284,7 @@ async def handle_client(reader, writer):
 
 async def main():
     server = await asyncio.start_server(handle_client, "0.0.0.0", 25565)
-    print("Listening on 25565 (Robust Hybrid Proxy)...")
+    print("Listening on 25565 (Hybrid Multi-Version Proxy)...")
     async with server:
         await server.serve_forever()
 

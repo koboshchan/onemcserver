@@ -1,1 +1,7 @@
-{"subdomain1.exmple.com":["donutsmp.net",25565]}
+[
+    {
+        "host": "play.example.com",
+        "transfer_to": ["12.34.56.78", 25565],
+        "cracked_players": true
+    }
+]
