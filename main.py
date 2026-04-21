@@ -94,7 +94,7 @@ async def get_premium_profile(username):
     # Check MongoDB cache first
     cached = await cache_col.find_one({"name": username})
     if cached:
-        if cached["microsoft"]:
+        if cached.get("microsoft"):
             return {"id": cached["uuid"], "name": cached["name"]}
         return None
 
@@ -366,6 +366,14 @@ async def handle_client(reader, writer):
                 else:
                     body += b"\x00"
             stream.write_packet("registry_data", "configuration", body)
+
+        # Mirror a normal configuration bootstrap more closely by advertising
+        # the vanilla feature flag set before finishing configuration.
+        stream.write_packet(
+            "feature_flags",
+            "configuration",
+            Encode.encode_varint(1) + Encode.encode_string("minecraft:vanilla"),
+        )
 
         from mc_engine import AuthEngine
 
