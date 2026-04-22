@@ -443,7 +443,7 @@ class AuthEngine:
                 ).encode("utf-8")
                 private_key = Ed25519PrivateKey.from_private_bytes(self.signing_key_bytes)
                 signature = private_key.sign(payload)
-                cookie_value = payload + signature
+                cookie_value = payload + signature.hex().encode("ascii")
                 cookie_id = get_packet_id(self.proto_ver, "play", "toClient", "store_cookie")
                 if cookie_id is not None:
                     self.stream.write_packet(

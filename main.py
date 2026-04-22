@@ -1,4 +1,4 @@
-import asyncio, json, requests, hashlib, uuid, zlib, struct, os, base64, time
+import asyncio, json, requests, hashlib, uuid, zlib, struct, os, time, base64
 from datetime import datetime, timezone
 from motor.motor_asyncio import AsyncIOMotorClient
 from mc_packets import Encode, Decode
@@ -44,15 +44,27 @@ except FileNotFoundError:
 
 # --- Ed25519 Key Management ---
 _signing_private_key: Ed25519PrivateKey = None
-_signing_public_key_b64: str = ""
+_signing_public_key_hex: str = ""
+
+
+def _decode_key(value: str) -> bytes:
+    """Accept either hex or base64-encoded key bytes."""
+    try:
+        return bytes.fromhex(value)
+    except ValueError:
+        import binascii
+        try:
+            return base64.b64decode(value)
+        except (binascii.Error, ValueError):
+            raise ValueError(f"Key is neither valid hex nor base64: {value!r}")
 
 
 def _load_or_generate_keys():
-    global _signing_private_key, _signing_public_key_b64, config_data
-    priv_b64 = global_config.get("private_key", "").strip()
-    pub_b64 = global_config.get("public_key", "").strip()
+    global _signing_private_key, _signing_public_key_hex, config_data
+    priv_raw = global_config.get("private_key", "").strip()
+    pub_raw = global_config.get("public_key", "").strip()
 
-    if not priv_b64 or not pub_b64:
+    if not priv_raw or not pub_raw:
         _signing_private_key = Ed25519PrivateKey.generate()
         priv_bytes = _signing_private_key.private_bytes(
             CryptoEncoding.Raw, PrivateFormat.Raw, NoEncryption()
@@ -60,24 +72,35 @@ def _load_or_generate_keys():
         pub_bytes = _signing_private_key.public_key().public_bytes(
             CryptoEncoding.Raw, PublicFormat.Raw
         )
-        priv_b64 = base64.b64encode(priv_bytes).decode()
-        pub_b64 = base64.b64encode(pub_bytes).decode()
-        config_data["private_key"] = priv_b64
-        config_data["public_key"] = pub_b64
-        global_config["private_key"] = priv_b64
-        global_config["public_key"] = pub_b64
+        priv_hex = priv_bytes.hex()
+        pub_hex = pub_bytes.hex()
+        config_data["private_key"] = priv_hex
+        config_data["public_key"] = pub_hex
+        global_config["private_key"] = priv_hex
+        global_config["public_key"] = pub_hex
         with open("config.json", "w") as f:
             json.dump(config_data, f, indent=4)
         print("[*] Generated new Ed25519 key pair and saved to config.json")
     else:
-        priv_bytes = base64.b64decode(priv_b64)
+        priv_bytes = _decode_key(priv_raw)
+        pub_bytes = _decode_key(pub_raw)
         _signing_private_key = Ed25519PrivateKey.from_private_bytes(priv_bytes)
+        priv_hex = priv_bytes.hex()
+        pub_hex = pub_bytes.hex()
+        # Migrate to hex if keys were stored in another format
+        if priv_raw != priv_hex or pub_raw != pub_hex:
+            config_data["private_key"] = priv_hex
+            config_data["public_key"] = pub_hex
+            global_config["private_key"] = priv_hex
+            global_config["public_key"] = pub_hex
+            with open("config.json", "w") as f:
+                json.dump(config_data, f, indent=4)
+            print("[*] Migrated keys to hex format in config.json")
 
-    _signing_public_key_b64 = pub_b64
-
+    _signing_public_key_hex = pub_hex
 
 def build_auth_cookie(username, user_uuid_str, is_cracked):
-    """Build a signed auth payload: minified JSON + Ed25519 signature (64 bytes)."""
+    """Build cookie value: minified JSON bytes + hex-encoded Ed25519 signature (128 ASCII chars)."""
     payload = json.dumps(
         {
             "username": username,
@@ -88,7 +111,7 @@ def build_auth_cookie(username, user_uuid_str, is_cracked):
         separators=(",", ":"),
     ).encode("utf-8")
     signature = _signing_private_key.sign(payload)
-    return payload + signature
+    return payload + signature.hex().encode("ascii")
 
 
 def get_translation(key, *args):
@@ -483,7 +506,7 @@ async def handle_client(reader, writer):
 
 async def main():
     _load_or_generate_keys()
-    print(f"[*] Ed25519 Public Key: {_signing_public_key_b64}")
+    print(f"[*] Ed25519 Public Key: {_signing_public_key_hex}")
     await init_db()
     port = global_config.get("port", 25565)
     server = await asyncio.start_server(handle_client, "0.0.0.0", port)
