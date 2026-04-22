@@ -1,5 +1,7 @@
 # onemcserver
 
+DEPRECATED: This project is no longer maintained. Please use [OneMcServerVelocity](https://github.com/koboshchan/OneMcServerVelocity) instead.
+
 oneserver but for minecraft.
 
 have you ever wanted to host multiple minecraft servers on one ip but don't want to deal with the hassle of remembering which port each server is on? well, this is the solution for you! with onemcserver, you can host multiple minecraft servers on one machine and have them all accessible through the same ip, via domain names or subdomains. simply edit the config.json file to add your servers and their forwarding ip and ports, and you're good to go!
@@ -15,13 +17,29 @@ make sure to also expose port of onemcserver (default: 25565) and your forwardin
 Edit `config.json` to define your domain mappings:
 
 ```json
-[
-    {
-        "host": "play.example.com",
-        "transfer_to": ["12.34.56.78", 25565],
-        "cracked_players": true
+{
+    "servers": [
+        {
+            "host": "play.example.com",
+            "transfer_to": [
+                "12.34.56.78",
+                25565
+            ],
+            "cracked_players": true
+        }
+    ],
+    "private_key": "",
+    "public_key": "",
+    "port": 25565,
+    "translations": {
+        "domain.unknown.disconnect": "Unknown domain: %s",
+        "domain.unknown.motd": "Unknown Domain",
+        "server.offline.motd": "The server is currently offline.",
+        "authentication.failed.disconnect": "That name is registered to a premium account. Please log in with your official account. Or restart your client to try again.",
+        "token.invalid.disconnect": "Invalid verify token. Please restart your client and try again.",
+        "online.mode.disconnect": "This server is in Online Mode. Please log in with your official account. Or restart your client to try again."
     }
-]
+}
 ```
 
 - **host**: The domain name players use to connect.

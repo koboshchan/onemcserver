@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from motor.motor_asyncio import AsyncIOMotorClient
 from mc_packets import Encode, Decode
 from mc_crypto import minecraft_sha1, MinecraftCipher, EncryptionContext
-from mc_protocol import get_packet_id
+from mc_protocol import get_packet_id, load_login_packet, resolve_login_packet_version
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import (
     Encoding as CryptoEncoding,
@@ -122,6 +122,68 @@ def get_translation(key, *args):
     if args:
         return text % args if "%s" in text else text
     return text
+
+
+def parse_client_core_version_from_known_packs(packet):
+    """Parse client known-packs response and extract minecraft:core version hint."""
+    try:
+        _, offset = Decode._read_varint(packet, 0)
+        count, offset = Decode._read_varint(packet, offset)
+        for _ in range(count):
+            namespace, offset = Decode._read_string(packet, offset)
+            pack_id, offset = Decode._read_string(packet, offset)
+            version, offset = Decode._read_string(packet, offset)
+            if namespace == "minecraft" and pack_id == "core":
+                return version
+    except Exception:
+        return None
+    return None
+
+
+def _collect_tag_refs(value, refs):
+    if isinstance(value, str):
+        if value.startswith("#"):
+            refs.add(value[1:])
+        return
+    if isinstance(value, dict):
+        for v in value.values():
+            _collect_tag_refs(v, refs)
+        return
+    if isinstance(value, list):
+        for v in value:
+            _collect_tag_refs(v, refs)
+
+
+def build_configuration_tags_packet(codec):
+    """Build configuration tags from tag references present in registry entries."""
+    registries = []
+    for reg_id, reg_data in codec.items():
+        entries = reg_data.get("entries", [])
+        if not entries:
+            continue
+
+        refs = set()
+        for entry in entries:
+            _collect_tag_refs(entry.get("value"), refs)
+
+        if not refs:
+            continue
+
+        # Use all entry indices as a permissive fallback membership set.
+        # This avoids unbound tags causing client-side registry load failures.
+        indices = list(range(len(entries)))
+        registries.append((reg_id, sorted(refs), indices))
+
+    body = Encode.encode_varint(len(registries))
+    for reg_id, tags, indices in registries:
+        body += Encode.encode_string(reg_id)
+        body += Encode.encode_varint(len(tags))
+        for tag_name in tags:
+            body += Encode.encode_string(tag_name)
+            body += Encode.encode_varint(len(indices))
+            for idx in indices:
+                body += Encode.encode_varint(idx)
+    return body
 
 
 class MinecraftStream:
@@ -403,7 +465,7 @@ async def handle_client(reader, writer):
         stream.compression_threshold = 256
 
         stream.write_packet(
-            "success", "login", Encode.login_success(user_uuid, username, properties)
+            "success", "login", Encode.login_success(user_uuid, username, properties, stream.protocol_version)
         )
         await stream.drain()
         print(f"[*] Sent Login Success to {username}")
@@ -423,13 +485,11 @@ async def handle_client(reader, writer):
                 f"[*] Sent Transfer for PREMIUM user {username} to {target_host}:{target_port}"
             )
             cookie_payload = build_auth_cookie(username, user_uuid, False)
-            cookie_id = get_packet_id(stream.protocol_version, "configuration", "toClient", "store_cookie")
-            if cookie_id is not None:
-                stream.write_packet(
-                    "store_cookie",
-                    "configuration",
-                    Encode.store_cookie("onemcserver:auth", cookie_payload),
-                )
+            stream.write_packet(
+                "store_cookie",
+                "configuration",
+                Encode.store_cookie("onemcserver:auth", cookie_payload),
+            )
             stream.write_packet(
                 "transfer", "configuration", Encode.transfer(target_host, target_port)
             )
@@ -441,27 +501,45 @@ async def handle_client(reader, writer):
         stream.write_packet(
             "custom_payload", "configuration", Encode.brand("onemcserver")
         )
+        schema_version = resolve_login_packet_version(stream.protocol_version)
         stream.write_packet(
-            "select_known_packs", "configuration", Encode.select_known_packs("1.21.1")
+            "select_known_packs",
+            "configuration",
+            Encode.select_known_packs(schema_version),
         )
         await stream.drain()
 
-        # Wait for client's known_packs response
-        await stream.read_packet()
-
-        # Send Registries (Mandatory for 1.20.5+)
-        from mc_protocol import loader
-
-        version_str = loader.proto_to_version.get(stream.protocol_version, "1.21.1")
-        lp_path = os.path.join(
-            "minecraft-data-repo", "data", "pc", version_str, "loginPacket.json"
+        # Wait for client's known_packs response, then use the client's own
+        # reported core pack version as schema hint for registry/login data.
+        known_packs_id = get_packet_id(
+            stream.protocol_version, "configuration", "toServer", "select_known_packs"
         )
-        if not os.path.exists(lp_path):
-            lp_path = os.path.join(
-                "minecraft-data-repo", "data", "pc", "1.21.1", "loginPacket.json"
+        known_packs_packet = None
+        while True:
+            packet = await stream.read_packet()
+            pid, _ = Decode._read_varint(packet, 0)
+            if known_packs_id is None or pid == known_packs_id:
+                known_packs_packet = packet
+                break
+
+        client_core_version = parse_client_core_version_from_known_packs(
+            known_packs_packet
+        )
+        if client_core_version:
+            schema_version = resolve_login_packet_version(
+                stream.protocol_version, client_core_version
+            )
+            print(
+                f"[*] Client core version hint: {client_core_version} -> schema {schema_version}"
             )
 
-        lp_data = json.load(open(lp_path))
+        # Send Registries (Mandatory for 1.20.5+)
+        resolved_version, lp_data = load_login_packet(
+            stream.protocol_version, schema_version
+        )
+        print(
+            f"[*] Using loginPacket schema {resolved_version} for protocol {stream.protocol_version}"
+        )
         codec = lp_data.get("dimensionCodec", {})
 
         for reg_id, reg_data in codec.items():
@@ -477,6 +555,10 @@ async def handle_client(reader, writer):
                     body += b"\x00"
             stream.write_packet("registry_data", "configuration", body)
 
+        # Configuration tags are required for dynamic registries in newer clients.
+        tags_body = build_configuration_tags_packet(codec)
+        stream.write_packet("tags", "configuration", tags_body)
+
         # Mirror a normal configuration bootstrap more closely by advertising
         # the vanilla feature flag set before finishing configuration.
         stream.write_packet(
@@ -491,7 +573,13 @@ async def handle_client(reader, writer):
             CryptoEncoding.Raw, PrivateFormat.Raw, NoEncryption()
         )
         engine = AuthEngine(
-            stream, username, target_host, target_port, cache_col, signing_key_bytes
+            stream,
+            username,
+            target_host,
+            target_port,
+            cache_col,
+            signing_key_bytes,
+            resolved_version,
         )
         await engine.enter_limbo()
 

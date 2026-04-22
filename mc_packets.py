@@ -31,8 +31,9 @@ class Encode:
         )
 
     @staticmethod
-    def login_success(uuid_str, username, properties=[]):
+    def login_success(uuid_str, username, properties=[], protocol_version=767):
         import uuid as uuid_lib
+        from mc_protocol import loader
 
         uuid_bytes = uuid_lib.UUID(uuid_str).bytes
         props_data = Encode.encode_varint(len(properties))
@@ -43,7 +44,27 @@ class Encode:
                 props_data += b"\x01" + Encode.encode_string(prop["signature"])
             else:
                 props_data += b"\x00"
-        return uuid_bytes + Encode.encode_string(username) + props_data + b"\x00"
+
+        # strictErrorHandling field was added in 1.20.5 and removed in some 1.21.x versions.
+        # Check the schema for this client's version directly.
+        include_strict = False
+        try:
+            proto = loader.get_protocol(protocol_version)
+            types = proto.get("login", {}).get("toClient", {}).get("types", {})
+            pkt = types.get("packet_success", [])
+            # pkt is ["container", [field, ...]] — check field names
+            if len(pkt) > 1 and isinstance(pkt[1], list):
+                include_strict = any(
+                    isinstance(f, dict) and f.get("name") == "strictErrorHandling"
+                    for f in pkt[1]
+                )
+        except Exception:
+            pass
+
+        result = uuid_bytes + Encode.encode_string(username) + props_data
+        if include_strict:
+            result += b"\x00"  # strictErrorHandling = false
+        return result
 
     @staticmethod
     def set_compression(threshold=256):

@@ -14,11 +14,20 @@ from cryptography.hazmat.primitives.serialization import (
     NoEncryption,
 )
 from mc_packets import Encode, Decode
-from mc_protocol import loader, get_packet_id
+from mc_protocol import get_packet_id, load_login_packet
 
 
 class AuthEngine:
-    def __init__(self, stream, username, target_host, target_port, cache_col, signing_key_bytes=None):
+    def __init__(
+        self,
+        stream,
+        username,
+        target_host,
+        target_port,
+        cache_col,
+        signing_key_bytes=None,
+        schema_version=None,
+    ):
         self.stream = stream
         self.username = username
         self.target_host = target_host
@@ -27,6 +36,7 @@ class AuthEngine:
         self.proto_ver = stream.protocol_version
         self.cache_col = cache_col
         self.signing_key_bytes = signing_key_bytes
+        self.schema_version = schema_version
         self._keepalive_task = None
         self.limbo_chunk_radius = 2
         self.limbo_view_distance = 2
@@ -168,7 +178,6 @@ class AuthEngine:
         self.stream.write_packet("update_time", "play", struct.pack(">qq", 0, 6000))
         self.stream.write_packet("server_data", "play", self.create_server_data())
         self.stream.write_packet("declare_recipes", "play", self.create_empty_recipes())
-        self.stream.write_packet("tags", "play", self.create_empty_tags())
 
         # Flush the initial world bootstrap and wait for the client to accept the
         # first teleport before entering the auth/chat phase. In 1.21.1 this is
@@ -252,16 +261,10 @@ class AuthEngine:
 
     def create_login_packet(self):
         """Builds a compliant Login (Play) packet using minecraft-data."""
-        version_str = loader.proto_to_version.get(self.proto_ver, "1.21.1")
-        lp_path = os.path.join(
-            "minecraft-data-repo", "data", "pc", version_str, "loginPacket.json"
+        resolved_version, lp = load_login_packet(self.proto_ver, self.schema_version)
+        print(
+            f"[*] Limbo login packet schema {resolved_version} for protocol {self.proto_ver}"
         )
-        if not os.path.exists(lp_path):
-            lp_path = os.path.join(
-                "minecraft-data-repo", "data", "pc", "1.21.1", "loginPacket.json"
-            )
-
-        lp = json.load(open(lp_path))
 
         body = struct.pack(">i?", int(lp["entityId"]), bool(lp["isHardcore"]))
         body += Encode.encode_varint(len(lp["worldNames"]))
@@ -444,13 +447,11 @@ class AuthEngine:
                 private_key = Ed25519PrivateKey.from_private_bytes(self.signing_key_bytes)
                 signature = private_key.sign(payload)
                 cookie_value = payload + signature.hex().encode("ascii")
-                cookie_id = get_packet_id(self.proto_ver, "play", "toClient", "store_cookie")
-                if cookie_id is not None:
-                    self.stream.write_packet(
-                        "store_cookie",
-                        "play",
-                        Encode.store_cookie("onemcserver:auth", cookie_value),
-                    )
+                self.stream.write_packet(
+                    "store_cookie",
+                    "play",
+                    Encode.store_cookie("onemcserver:auth", cookie_value),
+                )
             self.stream.write_packet(
                 "transfer", "play", Encode.transfer(self.target_host, self.target_port)
             )
