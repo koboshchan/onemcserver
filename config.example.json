@@ -1,7 +1,23 @@
-[
-    {
-        "host": "play.example.com",
-        "transfer_to": ["12.34.56.78", 25565],
-        "cracked_players": true
+{
+    "servers": [
+        {
+            "host": "play.example.com",
+            "transfer_to": [
+                "12.34.56.78",
+                25565
+            ],
+            "cracked_players": true
+        }
+    ],
+    "private_key": "",
+    "public_key": "",
+    "port": 25565,
+    "translations": {
+        "domain.unknown.disconnect": "Unknown domain: %s",
+        "domain.unknown.motd": "Unknown Domain",
+        "server.offline.motd": "The server is currently offline.",
+        "authentication.failed.disconnect": "That name is registered to a premium account. Please log in with your official account. Or restart your client to try again.",
+        "token.invalid.disconnect": "Invalid verify token. Please restart your client and try again.",
+        "online.mode.disconnect": "This server is in Online Mode. Please log in with your official account. Or restart your client to try again."
     }
-]
+}

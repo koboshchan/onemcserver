@@ -14,16 +14,34 @@ cache_col = db.user_cache
 async def init_db():
     # Create TTL index that expires documents 1 hour (3600 seconds) after the 'created' time
     await cache_col.create_index("created", expireAfterSeconds=3600)
-    print("[*] MongoDB Cache Initialized (1h TTL)")
+    print("[*] MongoDB Cache Initialized")
 
 
 try:
-    config_list = json.load(open("config.json", "r"))
-    config = {item["host"].lower(): item for item in config_list}
+    config_data = json.load(open("config.json", "r"))
+    # Support both old format (array) and new format (object with servers key)
+    if isinstance(config_data, list):
+        config_list = config_data
+        config = {item["host"].lower(): item for item in config_list}
+        global_config = {}
+    else:
+        config_list = config_data.get("servers", [])
+        config = {item["host"].lower(): item for item in config_list}
+        global_config = {k: v for k, v in config_data.items() if k != "servers"}
     print(f"[*] Loaded config for hosts: {', '.join(config.keys())}")
 except FileNotFoundError:
     print("[!] ERROR: config.json not found.")
     exit(1)
+
+
+def get_translation(key, *args):
+    """Get a translation string with optional formatting arguments."""
+    translations = global_config.get("translations", {})
+    text = translations.get(key, key)
+    # Support %s formatting if args provided
+    if args:
+        return text % args if "%s" in text else text
+    return text
 
 
 class MinecraftStream:
@@ -160,19 +178,21 @@ async def handle_client(reader, writer):
         if not entry:
             if handshake["next_state"] == 1:
                 await stream.read_packet()
+                motd_text = get_translation("domain.unknown.motd")
                 stream.writer.write(
                     Encode.status_response(
                         {
                             "version": {"name": "onemcserver", "protocol": 0},
                             "players": {"max": 0, "online": 0},
-                            "description": {"text": "Unknown Domain"},
+                            "description": {"text": motd_text},
                         }
                     )
                 )
                 await stream.drain()
             else:
+                disconnect_text = get_translation("domain.unknown.disconnect", host)
                 stream.write_packet(
-                    "disconnect", "login", Encode.disconnect(f"Unknown domain: {host}")
+                    "disconnect", "login", Encode.disconnect(disconnect_text)
                 )
                 await stream.drain()
             stream.close()
@@ -212,12 +232,13 @@ async def handle_client(reader, writer):
                 asyncio.create_task(pipe(reader, w_rem))
                 await pipe(r_rem, writer)
             except:
+                motd_text = get_translation("server.offline.motd")
                 stream.writer.write(
                     Encode.status_response(
                         {
                             "version": {"name": "offline", "protocol": 0},
                             "players": {"max": 0, "online": 0},
-                            "description": {"text": "§cServer Offline"},
+                            "description": {"text": "§c" + motd_text},
                         }
                     )
                 )
@@ -261,19 +282,19 @@ async def handle_client(reader, writer):
                     is_premium = True
                 else:
                     print(f"[!] {username} failed verification. Kicking.")
+                    disconnect_text = get_translation("authentication.failed.disconnect")
                     stream.write_packet(
                         "disconnect",
                         "login",
-                        Encode.disconnect(
-                            "That name is registered to a premium account. Please log in with your official account."
-                        ),
+                        Encode.disconnect(disconnect_text),
                     )
                     await stream.drain()
                     stream.close()
                     return
             else:
+                token_text = get_translation("token.invalid.disconnect")
                 stream.write_packet(
-                    "disconnect", "login", Encode.disconnect("Invalid verify token")
+                    "disconnect", "login", Encode.disconnect(token_text)
                 )
                 await stream.drain()
                 stream.close()
@@ -283,10 +304,11 @@ async def handle_client(reader, writer):
                 print(
                     f"[!] {username} is cracked and cracked players are disabled for {host}. Kicking."
                 )
+                online_mode_text = get_translation("online.mode.disconnect")
                 stream.write_packet(
                     "disconnect",
                     "login",
-                    Encode.disconnect("This server is in Online Mode."),
+                    Encode.disconnect(online_mode_text),
                 )
                 await stream.drain()
                 stream.close()
@@ -318,7 +340,7 @@ async def handle_client(reader, writer):
 
         if is_premium:
             print(
-                f"[*] Instant Transfer for PREMIUM user {username} to {target_host}:{target_port}"
+                f"[*] Sent Transfer for PREMIUM user {username} to {target_host}:{target_port}"
             )
             stream.write_packet(
                 "transfer", "configuration", Encode.transfer(target_host, target_port)
@@ -391,8 +413,9 @@ async def handle_client(reader, writer):
 
 async def main():
     await init_db()
-    server = await asyncio.start_server(handle_client, "0.0.0.0", 25565)
-    print("Listening on 25565 (Hybrid Multi-Version Proxy)...")
+    port = global_config.get("port", 25565)
+    server = await asyncio.start_server(handle_client, "0.0.0.0", port)
+    print(f"[*] Listening on {port}")
     async with server:
         await server.serve_forever()
 

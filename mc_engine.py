@@ -40,7 +40,7 @@ class AuthEngine:
                 break
 
         # NOW IN PLAY STATE
-        print(f"[*] {self.username} entered Auth Limbo (PLAY state)")
+        print(f"[*] {self.username} entered PLAY state")
 
         # 3. Login packet (first packet in play state)
         self.stream.write_packet("login", "play", self.create_login_packet())
