@@ -6,7 +6,7 @@ services:
     ports:
       - 25565:25565
     volumes:
-      - ./config.json:/app/config.json:ro
+      - ./config.json:/app/config.json
     depends_on:
       - mongo
 
