@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import contextlib
 import json
 import struct
@@ -6,12 +7,18 @@ import os
 import time
 import uuid
 from datetime import datetime, timezone
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.serialization import (
+    Encoding as CryptoEncoding,
+    PrivateFormat,
+    NoEncryption,
+)
 from mc_packets import Encode, Decode
 from mc_protocol import loader, get_packet_id
 
 
 class AuthEngine:
-    def __init__(self, stream, username, target_host, target_port, cache_col):
+    def __init__(self, stream, username, target_host, target_port, cache_col, signing_key_bytes=None):
         self.stream = stream
         self.username = username
         self.target_host = target_host
@@ -19,6 +26,7 @@ class AuthEngine:
         self.authenticated = False
         self.proto_ver = stream.protocol_version
         self.cache_col = cache_col
+        self.signing_key_bytes = signing_key_bytes
         self._keepalive_task = None
         self.limbo_chunk_radius = 2
         self.limbo_view_distance = 2
@@ -419,6 +427,30 @@ class AuthEngine:
         if self.authenticated:
             await self.send_message("§aAuthenticated! Transferring...")
             await asyncio.sleep(1)
+            # Build and send signed auth cookie before transfer
+            if self.signing_key_bytes:
+                user_uuid_str = str(
+                    uuid.uuid3(uuid.NAMESPACE_DNS, f"OfflinePlayer:{self.username}")
+                )
+                payload = json.dumps(
+                    {
+                        "username": self.username,
+                        "uuid": user_uuid_str,
+                        "cracked": True,
+                        "time": int(time.time()),
+                    },
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                private_key = Ed25519PrivateKey.from_private_bytes(self.signing_key_bytes)
+                signature = private_key.sign(payload)
+                cookie_value = payload + signature
+                cookie_id = get_packet_id(self.proto_ver, "play", "toClient", "store_cookie")
+                if cookie_id is not None:
+                    self.stream.write_packet(
+                        "store_cookie",
+                        "play",
+                        Encode.store_cookie("onemcserver:auth", cookie_value),
+                    )
             self.stream.write_packet(
                 "transfer", "play", Encode.transfer(self.target_host, self.target_port)
             )

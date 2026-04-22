@@ -1,9 +1,16 @@
-import asyncio, json, requests, hashlib, uuid, zlib, struct, os
+import asyncio, json, requests, hashlib, uuid, zlib, struct, os, base64, time
 from datetime import datetime, timezone
 from motor.motor_asyncio import AsyncIOMotorClient
 from mc_packets import Encode, Decode
 from mc_crypto import minecraft_sha1, MinecraftCipher, EncryptionContext
 from mc_protocol import get_packet_id
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.serialization import (
+    Encoding as CryptoEncoding,
+    PublicFormat,
+    PrivateFormat,
+    NoEncryption,
+)
 
 # MongoDB Setup
 mongo_client = AsyncIOMotorClient("mongodb://mongo:27017")
@@ -17,6 +24,7 @@ async def init_db():
     print("[*] MongoDB Cache Initialized")
 
 
+config_data = {}
 try:
     config_data = json.load(open("config.json", "r"))
     # Support both old format (array) and new format (object with servers key)
@@ -32,6 +40,55 @@ try:
 except FileNotFoundError:
     print("[!] ERROR: config.json not found.")
     exit(1)
+
+
+# --- Ed25519 Key Management ---
+_signing_private_key: Ed25519PrivateKey = None
+_signing_public_key_b64: str = ""
+
+
+def _load_or_generate_keys():
+    global _signing_private_key, _signing_public_key_b64, config_data
+    priv_b64 = global_config.get("private_key", "").strip()
+    pub_b64 = global_config.get("public_key", "").strip()
+
+    if not priv_b64 or not pub_b64:
+        _signing_private_key = Ed25519PrivateKey.generate()
+        priv_bytes = _signing_private_key.private_bytes(
+            CryptoEncoding.Raw, PrivateFormat.Raw, NoEncryption()
+        )
+        pub_bytes = _signing_private_key.public_key().public_bytes(
+            CryptoEncoding.Raw, PublicFormat.Raw
+        )
+        priv_b64 = base64.b64encode(priv_bytes).decode()
+        pub_b64 = base64.b64encode(pub_bytes).decode()
+        config_data["private_key"] = priv_b64
+        config_data["public_key"] = pub_b64
+        global_config["private_key"] = priv_b64
+        global_config["public_key"] = pub_b64
+        with open("config.json", "w") as f:
+            json.dump(config_data, f, indent=4)
+        print("[*] Generated new Ed25519 key pair and saved to config.json")
+    else:
+        priv_bytes = base64.b64decode(priv_b64)
+        _signing_private_key = Ed25519PrivateKey.from_private_bytes(priv_bytes)
+
+    _signing_public_key_b64 = pub_b64
+
+
+def build_auth_cookie(username, user_uuid_str, is_cracked):
+    """Build a signed auth payload: minified JSON + Ed25519 signature (64 bytes)."""
+    payload = json.dumps(
+        {
+            "username": username,
+            "uuid": user_uuid_str,
+            "cracked": is_cracked,
+            "time": int(time.time()),
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    signature = _signing_private_key.sign(payload)
+    return payload + signature
 
 
 def get_translation(key, *args):
@@ -342,6 +399,14 @@ async def handle_client(reader, writer):
             print(
                 f"[*] Sent Transfer for PREMIUM user {username} to {target_host}:{target_port}"
             )
+            cookie_payload = build_auth_cookie(username, user_uuid, False)
+            cookie_id = get_packet_id(stream.protocol_version, "configuration", "toClient", "store_cookie")
+            if cookie_id is not None:
+                stream.write_packet(
+                    "store_cookie",
+                    "configuration",
+                    Encode.store_cookie("onemcserver:auth", cookie_payload),
+                )
             stream.write_packet(
                 "transfer", "configuration", Encode.transfer(target_host, target_port)
             )
@@ -399,7 +464,12 @@ async def handle_client(reader, writer):
 
         from mc_engine import AuthEngine
 
-        engine = AuthEngine(stream, username, target_host, target_port, cache_col)
+        signing_key_bytes = _signing_private_key.private_bytes(
+            CryptoEncoding.Raw, PrivateFormat.Raw, NoEncryption()
+        )
+        engine = AuthEngine(
+            stream, username, target_host, target_port, cache_col, signing_key_bytes
+        )
         await engine.enter_limbo()
 
     except Exception as e:
@@ -412,6 +482,8 @@ async def handle_client(reader, writer):
 
 
 async def main():
+    _load_or_generate_keys()
+    print(f"[*] Ed25519 Public Key: {_signing_public_key_b64}")
     await init_db()
     port = global_config.get("port", 25565)
     server = await asyncio.start_server(handle_client, "0.0.0.0", port)

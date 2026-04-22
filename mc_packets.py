@@ -54,6 +54,14 @@ class Encode:
         return Encode.encode_string(host) + Encode.encode_varint(port)
 
     @staticmethod
+    def store_cookie(identifier, value_bytes):
+        return (
+            Encode.encode_string(identifier)
+            + Encode.encode_varint(len(value_bytes))
+            + value_bytes
+        )
+
+    @staticmethod
     def brand(brand="onemcserver"):
         brand_data = Encode.encode_string(brand)
         return Encode.encode_string("minecraft:brand") + brand_data
