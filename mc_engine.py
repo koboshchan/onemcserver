@@ -162,6 +162,12 @@ class AuthEngine:
         self.stream.write_packet("declare_recipes", "play", self.create_empty_recipes())
         self.stream.write_packet("tags", "play", self.create_empty_tags())
 
+        # Flush the initial world bootstrap and wait for the client to accept the
+        # first teleport before entering the auth/chat phase. In 1.21.1 this is
+        # one of the key signals that the client is done with the loading screen.
+        await self.stream.drain()
+        await self.await_initial_teleport_confirm(1)
+
         # 9. Prompt for password
         await self.send_message("§6[onemcserver] §eWelcome! This is a cracked account.")
 
@@ -209,6 +215,32 @@ class AuthEngine:
                         return
         except (asyncio.TimeoutError, ConnectionError):
             pass
+
+    async def await_initial_teleport_confirm(self, teleport_id):
+        teleport_confirm_id = get_packet_id(
+            self.proto_ver, "play", "toServer", "teleport_confirm"
+        )
+        if teleport_confirm_id is None:
+            return
+
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            timeout = max(0.1, deadline - time.time())
+            try:
+                packet = await asyncio.wait_for(self.stream.read_packet(), timeout=timeout)
+            except asyncio.TimeoutError:
+                break
+
+            pid, offset = Decode._read_varint(packet, 0)
+            if pid != teleport_confirm_id:
+                continue
+
+            received_teleport_id, _ = Decode._read_varint(packet, offset)
+            if received_teleport_id == teleport_id:
+                print(f"[*] Received initial teleport confirm from {self.username}")
+                return
+
+        print(f"[!] Timed out waiting for initial teleport confirm from {self.username}")
 
     def create_login_packet(self):
         """Builds a compliant Login (Play) packet using minecraft-data."""
